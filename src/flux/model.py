@@ -5,6 +5,7 @@ from torch import Tensor, nn
 
 from .modules.layers import (
     ForwardCacheRuntime,
+    Stage,
     DoubleStreamBlock,
     EmbedND,
     LastLayer,
@@ -99,6 +100,7 @@ class Flux(nn.Module):
         guidance: Tensor | None = None,
         collect: dict[object, object] | list[object] | set[object] | None = None,
         cache: dict[object, Tensor] | None = None,
+        stage: Stage = "full",
         return_collected: bool = False,
     ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
         """
@@ -117,13 +119,14 @@ class Flux(nn.Module):
                   where op is one of:
                     - "skip": return None for this tensor (fail-fast if later needed)
                     - "compute": compute normally, do not store output cache
-                    - "compute_and_cache": compute and store in output cache
-                    - "use_cache": read from input cache, error if missing
+                                        - "compute_and_cache": if input cache has key, reuse it;
+                                            otherwise compute and store in output cache
                 - Iterable form: interpreted as keys with "compute_and_cache".
                 Supported key formats:
                     - "stream:layer_idx:tensor_name"
                     - (stream, layer_idx, tensor_name)
-            cache: Optional input cache mapping. Used by "use_cache" keys.
+                        cache: Optional input cache mapping. Used by "compute_and_cache"
+                                keys as a preferred source before computation.
                 Keys use the same format as collect. Values are tensors.
             return_collected: If True, return (output, generated_cache).
                 generated_cache contains only tensors produced by
@@ -139,13 +142,13 @@ class Flux(nn.Module):
                out, new_cache = model(..., collect=collect, return_collected=True)
 
             2) Reuse cached tensor in a later run:
-               collect = {"double_stream:0:attn": "use_cache"}
+                    collect = {"double_stream:0:attn": "compute_and_cache"}
                out = model(..., collect=collect, cache=new_cache)
         """
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
-        cache_runtime = ForwardCacheRuntime(collect=collect, cache=cache)
+        cache_runtime = ForwardCacheRuntime(collect=collect, cache=cache, stage=stage)
 
         # running on sequences img
         img = self.img_in(img)

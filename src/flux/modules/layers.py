@@ -10,8 +10,9 @@ from torch import Tensor, nn
 from flux.math import attention, rope
 
 
-CollectOp = Literal["skip", "compute", "compute_and_cache", "use_cache"]
-VALID_COLLECT_OPS = {"skip", "compute", "compute_and_cache", "use_cache"}
+CollectOp = Literal["skip", "compute", "compute_and_cache"]
+Stage = Literal["full", "cache"]
+VALID_COLLECT_OPS = {"skip", "compute", "compute_and_cache"}
 
 
 @dataclass(frozen=True)
@@ -93,61 +94,6 @@ def _parse_collect_op(raw_op: object) -> CollectOp:
     return cast(CollectOp, raw_op)
 
 
-def validate_collect_config(
-    collect: Mapping[object, object] | None,
-    cache: Mapping[object, Tensor] | None = None,
-) -> None:
-    """Validate collect config for operation legality and dependency consistency."""
-    if collect is None:
-        return
-
-    grouped: dict[tuple[str, int], dict[str, CollectOp]] = {}
-    for raw_key, raw_op in collect.items():
-        key = CacheKey.parse(raw_key)
-        op = _parse_collect_op(raw_op)
-        grouped.setdefault((key.stream, key.layer_idx), {})[key.tensor_name] = op
-
-    cache_keys: set[CacheKey] = set()
-    if cache is not None:
-        cache_keys = {CacheKey.parse(key) for key in cache.keys()}
-
-    for (stream, layer_idx), ops_by_name in grouped.items():
-        order = STREAM_TENSOR_EXECUTION_ORDER.get(stream)
-        if order is None:
-            raise ValueError(f"Unknown stream in collect config: {stream}")
-
-        skip_seen = False
-        for tensor_name in order:
-            if tensor_name not in ops_by_name:
-                continue
-            op = ops_by_name[tensor_name]
-
-            if skip_seen and op not in {"skip", "use_cache"}:
-                raise ValueError(
-                    "Invalid collect config: once a previous tensor is marked as 'skip', "
-                    "later tensors in the same stream/layer must be 'skip' or 'use_cache'. "
-                    f"Found op '{op}' at {stream}:{layer_idx}:{tensor_name}."
-                )
-
-            if op == "use_cache":
-                key = CacheKey(stream=stream, layer_idx=layer_idx, tensor_name=tensor_name)
-                if key not in cache_keys:
-                    raise ValueError(
-                        "Invalid collect config: op 'use_cache' requires an input cache entry. "
-                        f"Missing key: {key.flat()}"
-                    )
-
-            if op == "skip":
-                skip_seen = True
-
-        unknown_names = set(ops_by_name.keys()) - set(order)
-        if unknown_names:
-            unknown_names_str = ", ".join(sorted(unknown_names))
-            raise ValueError(
-                f"Unknown tensor names for {stream}:{layer_idx}: {unknown_names_str}"
-            )
-
-
 def build_collect_keys(
     stream: str,
     layer_idx: int,
@@ -176,32 +122,30 @@ class ForwardCacheRuntime:
         self,
         collect: Mapping[object, object] | Iterable[object] | None = None,
         cache: Mapping[object, Tensor] | None = None,
+        stage: Stage = "full",
     ):
         self.cache_storage: dict[CacheKey, Tensor] = {}
         self.operations: dict[CacheKey, CollectOp] = {}
         self.generated_cache: dict[CacheKey, Tensor] = {}
+        self.stage = stage
 
-        if isinstance(collect, Mapping):
-            validate_collect_config(collect=collect, cache=cache)
+        # if isinstance(collect, Mapping):
+        #     validate_collect_config(collect=collect, cache=cache)
 
         if cache is not None:
             for key, value in cache.items():
                 self.cache_storage[CacheKey.parse(key)] = value
 
         if collect is None:
-            return
-
-        if isinstance(collect, Mapping):
+            pass
+        elif isinstance(collect, Mapping):
             for key, op in collect.items():
                 self.operations[CacheKey.parse(key)] = _parse_collect_op(op)
-            return
-
-        if isinstance(collect, Iterable) and not isinstance(collect, (str, bytes)):
+        elif isinstance(collect, Iterable) and not isinstance(collect, (str, bytes)):
             for key in collect:
                 self.operations[CacheKey.parse(key)] = "compute_and_cache"
-            return
-
-        raise TypeError("collect must be None, a mapping of key->op, or an iterable of keys.")
+        else:
+            raise TypeError("collect must be None, a mapping of key->op, or an iterable of keys.")
 
     def resolve(
         self,
@@ -212,25 +156,28 @@ class ForwardCacheRuntime:
     ) -> Tensor:
         key = CacheKey(stream=stream, layer_idx=layer_idx, tensor_name=tensor_name)
         op = self.operations.get(key, "compute")
+        
+        if self.stage == "full":
+            value = compute_fn()
+            if op == "compute_and_cache":
+                self.generated_cache[key] = value
+            return value
+        assert self.stage == "cache", f"Unsupported stage: {self.stage}"
 
         if op == "skip":
             # Intentional hard-skip: return None placeholder and let downstream fail fast
             # if this tensor is actually required by subsequent computation.
             return cast(Tensor, None)
-
-        if op == "use_cache":
-            if key not in self.cache_storage:
-                raise KeyError(
-                    f"Tensor cache miss for {key.flat()} while op='use_cache'."
-                )
-            return self.cache_storage[key]
-
-        value = compute_fn()
-
-        if op == "compute_and_cache":
-            self.generated_cache[key] = value
-
-        return value
+        elif op == "compute_and_cache":
+            if key in self.cache_storage:
+                return self.cache_storage[key]
+            else:
+                raise KeyError(f"Cache key not found for compute_and_cache op: {key.flat()} at stage 'cache'")
+        elif op == "compute":
+            value = compute_fn()
+            return value
+        else:
+            raise ValueError(f"Unsupported collect op: {op}")
 
     def collected_as_flat_dict(self) -> dict[str, Tensor]:
         return {key.flat(): value for key, value in self.generated_cache.items()}
