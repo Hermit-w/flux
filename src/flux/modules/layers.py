@@ -399,7 +399,10 @@ class DoubleStreamBlock(nn.Module):
         # prepare image for attention
         img_modulated = cached("img_modulated", lambda: (1 + img_mod1.scale) * self.img_norm1(img) + img_mod1.shift)
         img_qkv = cached("img_qkv", lambda: self.img_attn.qkv(img_modulated))
-        img_q_raw, img_k_raw, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        if img_qkv is None:
+            img_q_raw, img_k_raw, img_v = cast(Tensor, None), cast(Tensor, None), cast(Tensor, None)
+        else:
+            img_q_raw, img_k_raw, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         img_normed = resolve_cached_tensors(
             cache_runtime=cache_runtime,
             stream=stream,
@@ -409,13 +412,19 @@ class DoubleStreamBlock(nn.Module):
                 "img_k_norm": lambda: self.img_attn.norm.normalize_key(img_k_raw, img_v),
             },
         )
-        img_q = img_normed["img_q_norm"]
-        img_k = img_normed["img_k_norm"]
+        if img_normed is None:
+            img_q, img_k = cast(Tensor, None), cast(Tensor, None)
+        else:
+            img_q = img_normed["img_q_norm"]
+            img_k = img_normed["img_k_norm"]
 
         # prepare txt for attention
         txt_modulated = cached("txt_modulated", lambda: (1 + txt_mod1.scale) * self.txt_norm1(txt) + txt_mod1.shift)
         txt_qkv = cached("txt_qkv", lambda: self.txt_attn.qkv(txt_modulated))
-        txt_q_raw, txt_k_raw, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        if txt_qkv is None:
+            txt_q_raw, txt_k_raw, txt_v = cast(Tensor, None), cast(Tensor, None), cast(Tensor, None)
+        else:
+            txt_q_raw, txt_k_raw, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         txt_normed = resolve_cached_tensors(
             cache_runtime=cache_runtime,
             stream=stream,
@@ -425,8 +434,11 @@ class DoubleStreamBlock(nn.Module):
                 "txt_k_norm": lambda: self.txt_attn.norm.normalize_key(txt_k_raw, txt_v),
             },
         )
-        txt_q = txt_normed["txt_q_norm"]
-        txt_k = txt_normed["txt_k_norm"]
+        if txt_normed is None:
+            txt_q, txt_k = cast(Tensor, None), cast(Tensor, None)
+        else:
+            txt_q = txt_normed["txt_q_norm"]
+            txt_k = txt_normed["txt_k_norm"]
 
         # run actual attention
         q = cached("q", lambda: torch.cat((txt_q, img_q), dim=2))
@@ -434,7 +446,10 @@ class DoubleStreamBlock(nn.Module):
         v = cached("v", lambda: torch.cat((txt_v, img_v), dim=2))
 
         attn = cached("attn", lambda: attention(q, k, v, pe=pe))
-        txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
+        if attn is None:
+            txt_attn, img_attn = cast(Tensor, None), cast(Tensor, None)
+        else:
+            txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
 
         # calculate the img blocks
         img_attn_proj = cached("img_attn_proj", lambda: self.img_attn.proj(img_attn))
@@ -514,9 +529,15 @@ class SingleStreamBlock(nn.Module):
         mod, _ = self.modulation(vec)
         x_mod = cached("x_mod", lambda: (1 + mod.scale) * self.pre_norm(x) + mod.shift)
         linear1_out = cached("linear1_out", lambda: self.linear1(x_mod))
-        qkv, mlp = torch.split(linear1_out, [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
+        if linear1_out is None:
+            qkv, mlp = cast(Tensor, None), cast(Tensor, None)
+        else:
+            qkv, mlp = torch.split(linear1_out, [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
-        q_raw, k_raw, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        if qkv is None:
+            q_raw, k_raw, v = cast(Tensor, None), cast(Tensor, None), cast(Tensor, None)
+        else:
+            q_raw, k_raw, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         qk_normed = resolve_cached_tensors(
             cache_runtime=cache_runtime,
             stream=stream,
@@ -526,8 +547,11 @@ class SingleStreamBlock(nn.Module):
                 "k_norm": lambda: self.norm.normalize_key(k_raw, v),
             },
         )
-        q = qk_normed["q_norm"]
-        k = qk_normed["k_norm"]
+        if qk_normed is None:
+            q, k = cast(Tensor, None), cast(Tensor, None)
+        else:
+            q = qk_normed["q_norm"]
+            k = qk_normed["k_norm"]
 
         # compute attention
         attn = cached("attn", lambda: attention(q, k, v, pe=pe))
