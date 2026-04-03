@@ -11,6 +11,7 @@ from flux.modules.layers import (
     SingleStreamBlock,
     timestep_embedding,
 )
+from flux.modules.cache import FluxModuleCache
 from flux.modules.lora import LinearLora, replace_linear_with_lora
 
 
@@ -90,6 +91,7 @@ class Flux(nn.Module):
         timesteps: Tensor,
         y: Tensor,
         guidance: Tensor | None = None,
+        cache: FluxModuleCache | None = None,
     ) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -107,12 +109,19 @@ class Flux(nn.Module):
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
 
-        for block in self.double_blocks:
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+        for layer_idx, block in enumerate(self.double_blocks):
+            img, txt = block(img=img, txt=txt, vec=vec, pe=pe, cache=cache, layer_idx=layer_idx)
 
         img = torch.cat((txt, img), 1)
-        for block in self.single_blocks:
-            img = block(img, vec=vec, pe=pe)
+        single_stream_offset = len(self.double_blocks)
+        for layer_idx, block in enumerate(self.single_blocks):
+            img = block(
+                img,
+                vec=vec,
+                pe=pe,
+                cache=cache,
+                layer_idx=single_stream_offset + layer_idx,
+            )
         img = img[:, txt.shape[1] :, ...]
 
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)

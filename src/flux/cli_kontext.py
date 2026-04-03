@@ -8,6 +8,7 @@ import torch
 from fire import Fire
 
 from flux.content_filters import PixtralContentFilter
+from flux.modules.cache import build_module_cache, parse_method_params_json
 from flux.sampling import denoise, get_schedule, prepare_kontext, unpack
 from flux.util import (
     aspect_ratio_to_height_width,
@@ -163,6 +164,13 @@ def main(
     trt: bool = False,
     trt_transformer_precision: str = "bf16",
     track_usage: bool = False,
+    cache_enabled: bool = False,
+    cache_update_interval: int = 2,
+    cache_warmup_steps: int = 1,
+    cache_method: str = "linear",
+    cache_method_params: str | None = None,
+    cache_config_path: str | None = None,
+    cache_save_config: bool = True,
 ):
     """
     Sample the flux model. Either interactively (set `--loop`) or run for a
@@ -185,6 +193,13 @@ def main(
         img_cond_path: path to conditioning image (jpeg/png/webp)
         trt: use TensorRT backend for optimized inference
         track_usage: track usage of the model for licensing purposes
+        cache_enabled: enable module-level cache for compute/predict acceleration
+        cache_update_interval: refresh interval in denoising steps (>=1)
+        cache_warmup_steps: number of initial steps that always run full compute
+        cache_method: cache strategy class name registered in FluxModuleCache
+        cache_method_params: JSON object string for method-specific parameters
+        cache_config_path: optional JSON config path to load cache settings from
+        cache_save_config: save effective cache config into output directory
     """
     assert name == "flux-dev-kontext", f"Got unknown model name: {name}"
 
@@ -247,6 +262,17 @@ def main(
     content_filter = PixtralContentFilter(torch.device("cpu"))
 
     rng = torch.Generator(device="cpu")
+    cache = build_module_cache(
+        enabled=cache_enabled,
+        update_interval=cache_update_interval,
+        warmup_steps=cache_warmup_steps,
+        method=cache_method,
+        method_params=parse_method_params_json(cache_method_params),
+        config_path=cache_config_path,
+    )
+    if cache is not None and cache_save_config:
+        cache.save_config(os.path.join(output_dir, "cache_config.json"))
+
     opts = SamplingOptions(
         prompt=prompt,
         width=width,
@@ -315,7 +341,9 @@ def main(
 
         # denoise initial noise
         t00 = time.time()
-        x = denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
+        if cache is not None:
+            cache.reset()
+        x = denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance, cache=cache)
         torch.cuda.synchronize()
         t01 = time.time()
         print(f"Denoising took {t01 - t00:.3f}s")

@@ -9,6 +9,7 @@ from torch import Tensor
 
 from .model import Flux
 from .modules.autoencoder import AutoEncoder
+from .modules.cache import FluxModuleCache
 from .modules.conditioner import HFEmbedder
 from .modules.image_embedders import CannyImageEncoder, DepthImageEncoder, ReduxImageEncoder
 from .util import PREFERED_KONTEXT_RESOLUTIONS
@@ -321,10 +322,14 @@ def denoise(
     # extra img tokens (sequence-wise)
     img_cond_seq: Tensor | None = None,
     img_cond_seq_ids: Tensor | None = None,
+    cache: FluxModuleCache | None = None,
 ):
     # this is ignored for schnell
     guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
-    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+    for step_idx, (t_curr, t_prev) in enumerate(zip(timesteps[:-1], timesteps[1:])):
+        if cache is not None:
+            cache.begin_step(step_index=step_idx, t_curr=float(t_curr), t_prev=float(t_prev))
+
         t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
         img_input = img
         img_input_ids = img_ids
@@ -344,6 +349,7 @@ def denoise(
             y=vec,
             timesteps=t_vec,
             guidance=guidance_vec,
+            cache=cache,
         )
         if img_input_ids is not None:
             pred = pred[:, : img.shape[1]]
