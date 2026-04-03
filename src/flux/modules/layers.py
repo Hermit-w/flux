@@ -1,11 +1,269 @@
 import math
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import Literal, cast
 
 import torch
 from einops import rearrange
 from torch import Tensor, nn
 
 from flux.math import attention, rope
+
+
+CollectOp = Literal["skip", "compute", "compute_and_cache", "use_cache"]
+VALID_COLLECT_OPS = {"skip", "compute", "compute_and_cache", "use_cache"}
+
+
+@dataclass(frozen=True)
+class CacheKey:
+    stream: str
+    layer_idx: int
+    tensor_name: str
+
+    @classmethod
+    def parse(cls, key: object) -> "CacheKey":
+        if isinstance(key, cls):
+            return key
+        if isinstance(key, tuple) and len(key) == 3:
+            stream, layer_idx, tensor_name = key
+            return cls(stream=str(stream), layer_idx=int(layer_idx), tensor_name=str(tensor_name))
+        if isinstance(key, str):
+            parts = key.split(":", 2)
+            if len(parts) != 3:
+                raise ValueError(
+                    "Cache key string must use format 'stream:layer_idx:tensor_name', "
+                    f"but got: {key}"
+                )
+            stream, layer_idx, tensor_name = parts
+            return cls(stream=stream, layer_idx=int(layer_idx), tensor_name=tensor_name)
+        raise TypeError(
+            "Cache key must be CacheKey, tuple[str, int, str], or string "
+            "'stream:layer_idx:tensor_name'."
+        )
+
+    def flat(self) -> str:
+        return f"{self.stream}:{self.layer_idx}:{self.tensor_name}"
+
+
+STREAM_TENSOR_EXECUTION_ORDER: dict[str, tuple[str, ...]] = {
+    "double_stream": (
+        "img_modulated",
+        "img_qkv",
+        "img_q_norm",
+        "img_k_norm",
+        "txt_modulated",
+        "txt_qkv",
+        "txt_q_norm",
+        "txt_k_norm",
+        "q",
+        "k",
+        "v",
+        "attn",
+        "img_attn_proj",
+        "img_after_attn",
+        "img_mlp_in",
+        "img_mlp_out",
+        "img_out",
+        "txt_attn_proj",
+        "txt_after_attn",
+        "txt_mlp_in",
+        "txt_mlp_out",
+        "txt_out",
+    ),
+    "single_stream": (
+        "x_mod",
+        "linear1_out",
+        "q_norm",
+        "k_norm",
+        "attn",
+        "mlp_act",
+        "output",
+        "x_out",
+    ),
+}
+
+
+# Full set of collectable tensors (per stream), derived from execution order.
+ALL_COLLECTABLE_TENSORS: dict[str, tuple[str, ...]] = STREAM_TENSOR_EXECUTION_ORDER
+
+
+def _parse_collect_op(raw_op: object) -> CollectOp:
+    if raw_op not in VALID_COLLECT_OPS:
+        raise ValueError(f"Unsupported collect op: {raw_op}")
+    return cast(CollectOp, raw_op)
+
+
+def validate_collect_config(
+    collect: Mapping[object, object] | None,
+    cache: Mapping[object, Tensor] | None = None,
+) -> None:
+    """Validate collect config for operation legality and dependency consistency."""
+    if collect is None:
+        return
+
+    grouped: dict[tuple[str, int], dict[str, CollectOp]] = {}
+    for raw_key, raw_op in collect.items():
+        key = CacheKey.parse(raw_key)
+        op = _parse_collect_op(raw_op)
+        grouped.setdefault((key.stream, key.layer_idx), {})[key.tensor_name] = op
+
+    cache_keys: set[CacheKey] = set()
+    if cache is not None:
+        cache_keys = {CacheKey.parse(key) for key in cache.keys()}
+
+    for (stream, layer_idx), ops_by_name in grouped.items():
+        order = STREAM_TENSOR_EXECUTION_ORDER.get(stream)
+        if order is None:
+            raise ValueError(f"Unknown stream in collect config: {stream}")
+
+        skip_seen = False
+        for tensor_name in order:
+            if tensor_name not in ops_by_name:
+                continue
+            op = ops_by_name[tensor_name]
+
+            if skip_seen and op not in {"skip", "use_cache"}:
+                raise ValueError(
+                    "Invalid collect config: once a previous tensor is marked as 'skip', "
+                    "later tensors in the same stream/layer must be 'skip' or 'use_cache'. "
+                    f"Found op '{op}' at {stream}:{layer_idx}:{tensor_name}."
+                )
+
+            if op == "use_cache":
+                key = CacheKey(stream=stream, layer_idx=layer_idx, tensor_name=tensor_name)
+                if key not in cache_keys:
+                    raise ValueError(
+                        "Invalid collect config: op 'use_cache' requires an input cache entry. "
+                        f"Missing key: {key.flat()}"
+                    )
+
+            if op == "skip":
+                skip_seen = True
+
+        unknown_names = set(ops_by_name.keys()) - set(order)
+        if unknown_names:
+            unknown_names_str = ", ".join(sorted(unknown_names))
+            raise ValueError(
+                f"Unknown tensor names for {stream}:{layer_idx}: {unknown_names_str}"
+            )
+
+
+def build_collect_keys(
+    stream: str,
+    layer_idx: int,
+    tensor_names: Iterable[str] | None = None,
+    flat: bool = True,
+) -> list[str] | list[tuple[str, int, str]]:
+    names = tuple(tensor_names) if tensor_names is not None else ALL_COLLECTABLE_TENSORS.get(stream, ())
+    if flat:
+        return [f"{stream}:{layer_idx}:{name}" for name in names]
+    return [(stream, layer_idx, name) for name in names]
+
+
+def build_collect_operations(
+    stream: str,
+    layer_idx: int,
+    tensor_names: Iterable[str] | None = None,
+    op: CollectOp = "compute_and_cache",
+    flat: bool = True,
+) -> dict[object, CollectOp]:
+    keys = build_collect_keys(stream=stream, layer_idx=layer_idx, tensor_names=tensor_names, flat=flat)
+    return {key: op for key in keys}
+
+
+class ForwardCacheRuntime:
+    def __init__(
+        self,
+        collect: Mapping[object, object] | Iterable[object] | None = None,
+        cache: Mapping[object, Tensor] | None = None,
+    ):
+        self.cache_storage: dict[CacheKey, Tensor] = {}
+        self.operations: dict[CacheKey, CollectOp] = {}
+        self.generated_cache: dict[CacheKey, Tensor] = {}
+
+        if isinstance(collect, Mapping):
+            validate_collect_config(collect=collect, cache=cache)
+
+        if cache is not None:
+            for key, value in cache.items():
+                self.cache_storage[CacheKey.parse(key)] = value
+
+        if collect is None:
+            return
+
+        if isinstance(collect, Mapping):
+            for key, op in collect.items():
+                self.operations[CacheKey.parse(key)] = _parse_collect_op(op)
+            return
+
+        if isinstance(collect, Iterable) and not isinstance(collect, (str, bytes)):
+            for key in collect:
+                self.operations[CacheKey.parse(key)] = "compute_and_cache"
+            return
+
+        raise TypeError("collect must be None, a mapping of key->op, or an iterable of keys.")
+
+    def resolve(
+        self,
+        stream: str,
+        layer_idx: int,
+        tensor_name: str,
+        compute_fn: Callable[[], Tensor],
+    ) -> Tensor:
+        key = CacheKey(stream=stream, layer_idx=layer_idx, tensor_name=tensor_name)
+        op = self.operations.get(key, "compute")
+
+        if op == "skip":
+            # Intentional hard-skip: return None placeholder and let downstream fail fast
+            # if this tensor is actually required by subsequent computation.
+            return cast(Tensor, None)
+
+        if op == "use_cache":
+            if key not in self.cache_storage:
+                raise KeyError(
+                    f"Tensor cache miss for {key.flat()} while op='use_cache'."
+                )
+            return self.cache_storage[key]
+
+        value = compute_fn()
+
+        if op == "compute_and_cache":
+            self.generated_cache[key] = value
+
+        return value
+
+    def collected_as_flat_dict(self) -> dict[str, Tensor]:
+        return {key.flat(): value for key, value in self.generated_cache.items()}
+
+
+def resolve_cached_tensor(
+    cache_runtime: ForwardCacheRuntime | None,
+    stream: str,
+    layer_idx: int,
+    tensor_name: str,
+    compute_fn: Callable[[], Tensor],
+) -> Tensor:
+    if cache_runtime is None:
+        return compute_fn()
+    return cache_runtime.resolve(stream=stream, layer_idx=layer_idx, tensor_name=tensor_name, compute_fn=compute_fn)
+
+
+def resolve_cached_tensors(
+    cache_runtime: ForwardCacheRuntime | None,
+    stream: str,
+    layer_idx: int,
+    compute_fns: Mapping[str, Callable[[], Tensor]],
+) -> dict[str, Tensor]:
+    return {
+        name: resolve_cached_tensor(
+            cache_runtime=cache_runtime,
+            stream=stream,
+            layer_idx=layer_idx,
+            tensor_name=name,
+            compute_fn=compute_fn,
+        )
+        for name, compute_fn in compute_fns.items()
+    }
 
 
 class EmbedND(nn.Module):
@@ -83,6 +341,12 @@ class QKNorm(torch.nn.Module):
         k = self.key_norm(k)
         return q.to(v), k.to(v)
 
+    def normalize_query(self, q: Tensor, v: Tensor) -> Tensor:
+        return self.query_norm(q).to(v)
+
+    def normalize_key(self, k: Tensor, v: Tensor) -> Tensor:
+        return self.key_norm(k).to(v)
+
 
 class SelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False):
@@ -127,12 +391,20 @@ class Modulation(nn.Module):
 
 
 class DoubleStreamBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float,
+        qkv_bias: bool = False,
+        layer_idx: int = -1,
+    ):
         super().__init__()
 
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
         self.hidden_size = hidden_size
+        self.layer_idx = layer_idx
         self.img_mod = Modulation(hidden_size, double=True)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
@@ -155,39 +427,87 @@ class DoubleStreamBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
 
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        img: Tensor,
+        txt: Tensor,
+        vec: Tensor,
+        pe: Tensor,
+        cache_runtime: ForwardCacheRuntime | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        stream = "double_stream"
+
+        def cached(name: str, compute_fn: Callable[[], Tensor]) -> Tensor:
+            return resolve_cached_tensor(
+                cache_runtime=cache_runtime,
+                stream=stream,
+                layer_idx=self.layer_idx,
+                tensor_name=name,
+                compute_fn=compute_fn,
+            )
+
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
 
         # prepare image for attention
-        img_modulated = self.img_norm1(img)
-        img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
-        img_qkv = self.img_attn.qkv(img_modulated)
-        img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
-        img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
+        img_modulated = cached("img_modulated", lambda: (1 + img_mod1.scale) * self.img_norm1(img) + img_mod1.shift)
+        img_qkv = cached("img_qkv", lambda: self.img_attn.qkv(img_modulated))
+        img_q_raw, img_k_raw, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        img_normed = resolve_cached_tensors(
+            cache_runtime=cache_runtime,
+            stream=stream,
+            layer_idx=self.layer_idx,
+            compute_fns={
+                "img_q_norm": lambda: self.img_attn.norm.normalize_query(img_q_raw, img_v),
+                "img_k_norm": lambda: self.img_attn.norm.normalize_key(img_k_raw, img_v),
+            },
+        )
+        img_q = img_normed["img_q_norm"]
+        img_k = img_normed["img_k_norm"]
 
         # prepare txt for attention
-        txt_modulated = self.txt_norm1(txt)
-        txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
-        txt_qkv = self.txt_attn.qkv(txt_modulated)
-        txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
-        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
+        txt_modulated = cached("txt_modulated", lambda: (1 + txt_mod1.scale) * self.txt_norm1(txt) + txt_mod1.shift)
+        txt_qkv = cached("txt_qkv", lambda: self.txt_attn.qkv(txt_modulated))
+        txt_q_raw, txt_k_raw, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        txt_normed = resolve_cached_tensors(
+            cache_runtime=cache_runtime,
+            stream=stream,
+            layer_idx=self.layer_idx,
+            compute_fns={
+                "txt_q_norm": lambda: self.txt_attn.norm.normalize_query(txt_q_raw, txt_v),
+                "txt_k_norm": lambda: self.txt_attn.norm.normalize_key(txt_k_raw, txt_v),
+            },
+        )
+        txt_q = txt_normed["txt_q_norm"]
+        txt_k = txt_normed["txt_k_norm"]
 
         # run actual attention
-        q = torch.cat((txt_q, img_q), dim=2)
-        k = torch.cat((txt_k, img_k), dim=2)
-        v = torch.cat((txt_v, img_v), dim=2)
+        q = cached("q", lambda: torch.cat((txt_q, img_q), dim=2))
+        k = cached("k", lambda: torch.cat((txt_k, img_k), dim=2))
+        v = cached("v", lambda: torch.cat((txt_v, img_v), dim=2))
 
-        attn = attention(q, k, v, pe=pe)
+        attn = cached("attn", lambda: attention(q, k, v, pe=pe))
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
 
         # calculate the img blocks
-        img = img + img_mod1.gate * self.img_attn.proj(img_attn)
-        img = img + img_mod2.gate * self.img_mlp((1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift)
+        img_attn_proj = cached("img_attn_proj", lambda: self.img_attn.proj(img_attn))
+        img_after_attn = cached("img_after_attn", lambda: img + img_mod1.gate * img_attn_proj)
+        img_mlp_in = cached(
+            "img_mlp_in",
+            lambda: (1 + img_mod2.scale) * self.img_norm2(img_after_attn) + img_mod2.shift,
+        )
+        img_mlp_out = cached("img_mlp_out", lambda: self.img_mlp(img_mlp_in))
+        img = cached("img_out", lambda: img_after_attn + img_mod2.gate * img_mlp_out)
 
         # calculate the txt blocks
-        txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
-        txt = txt + txt_mod2.gate * self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift)
+        txt_attn_proj = cached("txt_attn_proj", lambda: self.txt_attn.proj(txt_attn))
+        txt_after_attn = cached("txt_after_attn", lambda: txt + txt_mod1.gate * txt_attn_proj)
+        txt_mlp_in = cached(
+            "txt_mlp_in",
+            lambda: (1 + txt_mod2.scale) * self.txt_norm2(txt_after_attn) + txt_mod2.shift,
+        )
+        txt_mlp_out = cached("txt_mlp_out", lambda: self.txt_mlp(txt_mlp_in))
+        txt = cached("txt_out", lambda: txt_after_attn + txt_mod2.gate * txt_mlp_out)
         return img, txt
 
 
@@ -203,10 +523,12 @@ class SingleStreamBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         qk_scale: float | None = None,
+        layer_idx: int = -1,
     ):
         super().__init__()
         self.hidden_dim = hidden_size
         self.num_heads = num_heads
+        self.layer_idx = layer_idx
         head_dim = hidden_size // num_heads
         self.scale = qk_scale or head_dim**-0.5
 
@@ -224,19 +546,49 @@ class SingleStreamBlock(nn.Module):
         self.mlp_act = nn.GELU(approximate="tanh")
         self.modulation = Modulation(hidden_size, double=False)
 
-    def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
-        mod, _ = self.modulation(vec)
-        x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
-        qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
+    def forward(
+        self,
+        x: Tensor,
+        vec: Tensor,
+        pe: Tensor,
+        cache_runtime: ForwardCacheRuntime | None = None,
+    ) -> Tensor:
+        stream = "single_stream"
 
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
-        q, k = self.norm(q, k, v)
+        def cached(name: str, compute_fn: Callable[[], Tensor]) -> Tensor:
+            return resolve_cached_tensor(
+                cache_runtime=cache_runtime,
+                stream=stream,
+                layer_idx=self.layer_idx,
+                tensor_name=name,
+                compute_fn=compute_fn,
+            )
+
+        mod, _ = self.modulation(vec)
+        x_mod = cached("x_mod", lambda: (1 + mod.scale) * self.pre_norm(x) + mod.shift)
+        linear1_out = cached("linear1_out", lambda: self.linear1(x_mod))
+        qkv, mlp = torch.split(linear1_out, [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
+
+        q_raw, k_raw, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        qk_normed = resolve_cached_tensors(
+            cache_runtime=cache_runtime,
+            stream=stream,
+            layer_idx=self.layer_idx,
+            compute_fns={
+                "q_norm": lambda: self.norm.normalize_query(q_raw, v),
+                "k_norm": lambda: self.norm.normalize_key(k_raw, v),
+            },
+        )
+        q = qk_normed["q_norm"]
+        k = qk_normed["k_norm"]
 
         # compute attention
-        attn = attention(q, k, v, pe=pe)
+        attn = cached("attn", lambda: attention(q, k, v, pe=pe))
         # compute activation in mlp stream, cat again and run second linear layer
-        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
-        return x + mod.gate * output
+        mlp_act = cached("mlp_act", lambda: self.mlp_act(mlp))
+        output = cached("output", lambda: self.linear2(torch.cat((attn, mlp_act), 2)))
+        x = cached("x_out", lambda: x + mod.gate * output)
+        return x
 
 
 class LastLayer(nn.Module):

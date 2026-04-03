@@ -321,9 +321,13 @@ def denoise(
     # extra img tokens (sequence-wise)
     img_cond_seq: Tensor | None = None,
     img_cond_seq_ids: Tensor | None = None,
+    collect: dict[object, object] | list[object] | set[object] | None = None,
+    cache: dict[object, Tensor] | None = None,
+    return_collected: bool = False,
 ):
     # this is ignored for schnell
     guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+    collected: dict[str, Tensor] = {}
     for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
         t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
         img_input = img
@@ -336,7 +340,7 @@ def denoise(
             ), "You need to provide either both or neither of the sequence conditioning"
             img_input = torch.cat((img_input, img_cond_seq), dim=1)
             img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
-        pred = model(
+        model_out = model(
             img=img_input,
             img_ids=img_input_ids,
             txt=txt,
@@ -344,12 +348,22 @@ def denoise(
             y=vec,
             timesteps=t_vec,
             guidance=guidance_vec,
+            collect=collect,
+            cache=cache,
+            return_collected=return_collected,
         )
+        if return_collected:
+            pred, step_collected = model_out
+            collected.update(step_collected)
+        else:
+            pred = model_out
         if img_input_ids is not None:
             pred = pred[:, : img.shape[1]]
 
         img = img + (t_prev - t_curr) * pred
 
+    if return_collected:
+        return img, collected
     return img
 
 
