@@ -181,18 +181,10 @@ class Flux(nn.Module):
                 cache_runtime=cache_runtime,
             )
         img = img[:, txt.shape[1] :, ...]
-        collected = cache_runtime.collected_as_flat_dict() if return_collected else None
-        if collected is not None and "model:final_layer:input" in collect.keys():  # type: ignore[union-attr]
-            collected["model:final_layer:input"] = img
-        if collect is not None and collect.get("model:final_layer:input", "compute") == "skip":
-            if return_collected:
-                return img, collected  # type: ignore[return-value]
-            return img
-
 
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
         if return_collected:
-            return img, collected  # type: ignore[return-value]
+            return img, cache_runtime.collected_as_flat_dict()
         return img
 
 

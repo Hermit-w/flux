@@ -569,8 +569,17 @@ class LastLayer(nn.Module):
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
 
-    def forward(self, x: Tensor, vec: Tensor) -> Tensor:
+    def forward(self, x: Tensor, vec: Tensor, cache_runtime: ForwardCacheRuntime | None = None) -> Tensor:
         shift, scale = self.adaLN_modulation(vec).chunk(2, dim=1)
         x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
-        x = self.linear(x)
+        key = CacheKey(stream="final_layer", layer_idx=0, tensor_name="input")
+        if cache_runtime is not None and key in cache_runtime.operations.keys():
+            if cache_runtime.stage == 'full':
+                assert cache_runtime.operations[key] == "compute_and_cache", "Only 'compute_and_cache' op is supported for final_layer"
+                cache_runtime.generated_cache[key] = x
+                x = self.linear(x)
+            else:
+                assert cache_runtime.operations[key] == "skip", "Only 'skip' op is supported for final_layer at cache stage"
+        else:
+            x = self.linear(x)
         return x
