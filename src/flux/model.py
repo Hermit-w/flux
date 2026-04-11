@@ -182,7 +182,7 @@ class Flux(nn.Module):
             )
         img = img[:, txt.shape[1] :, ...]
 
-        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+        img = self.final_layer(img, vec, cache_runtime=cache_runtime)  # (N, T, patch_size ** 2 * out_channels)
         if return_collected:
             return img, cache_runtime.collected_as_flat_dict()
         return img
